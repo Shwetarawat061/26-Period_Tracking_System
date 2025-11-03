@@ -1,11 +1,11 @@
-// period_tracker_ds_fixed.cpp
-// Compile: g++ -std=c++17 period_tracker_ds_fixed.cpp -o period_tracker_ds_fixed
-// Run: ./period_tracker_ds_fixed
+// main.cpp
+// Compile: g++ -std=c++17 main.cpp -o period_tracker
+// Run: ./period_tracker
 
 #include <bits/stdc++.h>
 using namespace std;
 
-// ANSI for nicer terminal output
+// ANSI for nicer terminal output (works on most unix terminals)
 #define RESET   "\033[0m"
 #define BOLD    "\033[1m"
 #define RED     "\033[31m"
@@ -55,6 +55,7 @@ bool parseDate(const string &in, tm &out_tm) {
 bool stringToTimePoint(const string &s, sys_time &tp) {
     tm tm_ = {};
     if (!parseDate(s, tm_)) return false;
+    // mktime treats tm as local time; that's fine for day-granularity here
     time_t tt = mktime(&tm_);
     if (tt == -1) return false;
     tp = chrono::system_clock::from_time_t(tt);
@@ -63,17 +64,18 @@ bool stringToTimePoint(const string &s, sys_time &tp) {
 
 string timePointToString(const sys_time &tp) {
     time_t tt = chrono::system_clock::to_time_t(tp);
-    tm *tm_ = localtime(&tt);
+    tm tm_ = *localtime(&tt);
     ostringstream os;
-    os << put_time(tm_, "%Y-%m-%d");
+    os << put_time(&tm_, "%Y-%m-%d");
     return os.str();
 }
 
 int daysBetween(const string &d1, const string &d2) {
     sys_time t1, t2;
     if (!stringToTimePoint(d1, t1) || !stringToTimePoint(d2, t2)) return 0;
-    auto diff = chrono::duration_cast<chrono::hours>(t2 - t1).count() / 24;
-    return static_cast<int>(diff);
+    auto diff = chrono::duration_cast<chrono::hours>(t2 - t1).count();
+    // round toward zero; each day is 24 hours
+    return static_cast<int>(diff / 24);
 }
 
 string addDays(const string &dateStr, int days) {
@@ -87,8 +89,8 @@ int daysFromTodayTo(const string &dateStr) {
     sys_time now = chrono::system_clock::now();
     sys_time target;
     if (!stringToTimePoint(dateStr, target)) return 0;
-    auto diff = chrono::duration_cast<chrono::hours>(target - now).count() / 24;
-    return static_cast<int>(diff);
+    auto diff = chrono::duration_cast<chrono::hours>(target - now).count();
+    return static_cast<int>(diff / 24);
 }
 
 // ---------------- PeriodTracker Class ----------------
@@ -98,8 +100,8 @@ private:
     map<string, DailyLog> dailyLogs;
 
     // Undo/Redo stacks for cycles
-    stack<CycleEntry> undoStack; // push on add, push on delete (store removed entry)
-    stack<CycleEntry> redoStack; // when undo, push into redo
+    stack<pair<string, CycleEntry>> undoStack; // action, entry; action: "add" or "del"
+    stack<pair<string, CycleEntry>> redoStack;
 
     // Reminders: min-heap (earliest first)
     priority_queue<Reminder, vector<Reminder>, CompareReminder> reminders;
@@ -173,9 +175,10 @@ private:
     }
 
     void printHeader(const string &title) const {
-        cout << BOLD << CYAN << "\n╔════════════════════════════════════════════════════════╗\n";
+        cout << BOLD << CYAN;
+        cout << "\n╔═════════════════════════════════════════════════════════════════════════╗\n";
         cout << "  " << title << "\n";
-        cout << "╚════════════════════════════════════════════════════════╝\n" << RESET;
+        cout << "╚═════════════════════════════════════════════════════════════════════════╝\n" << RESET;
     }
 
     void pushReminder(const Reminder &r) {
@@ -191,7 +194,7 @@ private:
 
 public:
     PeriodTracker() { loadData(); }
-    ~PeriodTracker() { /* explicit save on exit */ }
+    ~PeriodTracker() { /* do not auto-save in destructor to avoid surprises; explicit save triggered by user */ }
 
     // --------- Cycle operations (add/delete/undo/redo) ----------
     void addCycleFromUser() {
@@ -210,7 +213,7 @@ public:
 
         int duration = daysBetween(start, end);
         if (duration < 0) {
-            cout << RED << "❌ End date must be after start date." << RESET << "\n";
+            cout << RED << "❌ End date must be after or same as start date." << RESET << "\n";
             return;
         }
 
@@ -221,7 +224,7 @@ public:
         cycles.push_back(e);
 
         // push to undo stack (for this add action)
-        undoStack.push(e);
+        undoStack.push({"add", e});
         // clear redo stack because new action
         while (!redoStack.empty()) redoStack.pop();
 
@@ -248,7 +251,8 @@ public:
         CycleEntry removed = *it;
         cycles.erase(it);
 
-        undoStack.push(removed);
+        // store delete action in undo stack
+        undoStack.push({"del", removed});
         while (!redoStack.empty()) redoStack.pop();
 
         cout << GREEN << "✅ Deleted cycle starting " << removed.startDate << RESET << "\n";
@@ -261,19 +265,41 @@ public:
             cout << YELLOW << "Nothing to undo." << RESET << "\n";
             return;
         }
-        CycleEntry top = undoStack.top(); undoStack.pop();
-        auto it = find_if(cycles.begin(), cycles.end(), [&](const CycleEntry &c){
-            return c.startDate == top.startDate && c.endDate == top.endDate;
-        });
+        auto topPair = undoStack.top(); undoStack.pop();
+        string action = topPair.first;
+        CycleEntry entry = topPair.second;
 
-        if (it != cycles.end()) {
-            cycles.erase(it);
-            cout << GREEN << "Undo: removed cycle starting " << top.startDate << RESET << "\n";
-            redoStack.push(top);
+        if (action == "add") {
+            // undo an add -> remove the cycle
+            auto it = find_if(cycles.begin(), cycles.end(), [&](const CycleEntry &c){
+                return c.startDate == entry.startDate && c.endDate == entry.endDate;
+            });
+            if (it != cycles.end()) {
+                cycles.erase(it);
+                cout << GREEN << "Undo: removed cycle starting " << entry.startDate << RESET << "\n";
+                // record opposite on redo stack
+                redoStack.push({"add", entry});
+            } else {
+                cout << YELLOW << "Undo: cycle not found to remove." << RESET << "\n";
+            }
+        } else if (action == "del") {
+            // undo a delete -> restore the cycle
+            auto it = find_if(cycles.begin(), cycles.end(), [&](const CycleEntry &c){
+                return c.startDate == entry.startDate && c.endDate == entry.endDate;
+            });
+            if (it == cycles.end()) {
+                cycles.push_back(entry);
+                // sort cycles by start date to keep order
+                sort(cycles.begin(), cycles.end(), [](const CycleEntry &a, const CycleEntry &b){
+                    return a.startDate < b.startDate;
+                });
+                cout << GREEN << "Undo: restored cycle starting " << entry.startDate << RESET << "\n";
+                redoStack.push({"del", entry});
+            } else {
+                cout << YELLOW << "Undo: cycle already exists; cannot restore." << RESET << "\n";
+            }
         } else {
-            cycles.push_back(top);
-            cout << GREEN << "Undo: restored cycle starting " << top.startDate << RESET << "\n";
-            redoStack.push(top);
+            cout << RED << "Unknown undo action." << RESET << "\n";
         }
         rebuildRemindersFromCycles();
     }
@@ -284,19 +310,39 @@ public:
             cout << YELLOW << "Nothing to redo." << RESET << "\n";
             return;
         }
-        CycleEntry top = redoStack.top(); redoStack.pop();
-        auto it = find_if(cycles.begin(), cycles.end(), [&](const CycleEntry &c){
-            return c.startDate == top.startDate && c.endDate == top.endDate;
-        });
+        auto topPair = redoStack.top(); redoStack.pop();
+        string action = topPair.first;
+        CycleEntry entry = topPair.second;
 
-        if (it != cycles.end()) {
-            cycles.erase(it);
-            cout << GREEN << "Redo: removed cycle starting " << top.startDate << RESET << "\n";
-            undoStack.push(top);
+        if (action == "add") {
+            // redo adding -> add back if not present
+            auto it = find_if(cycles.begin(), cycles.end(), [&](const CycleEntry &c){
+                return c.startDate == entry.startDate && c.endDate == entry.endDate;
+            });
+            if (it == cycles.end()) {
+                cycles.push_back(entry);
+                sort(cycles.begin(), cycles.end(), [](const CycleEntry &a, const CycleEntry &b){
+                    return a.startDate < b.startDate;
+                });
+                cout << GREEN << "Redo: restored cycle starting " << entry.startDate << RESET << "\n";
+                undoStack.push({"add", entry});
+            } else {
+                cout << YELLOW << "Redo: cycle already present." << RESET << "\n";
+            }
+        } else if (action == "del") {
+            // redo deleting -> remove if present
+            auto it = find_if(cycles.begin(), cycles.end(), [&](const CycleEntry &c){
+                return c.startDate == entry.startDate && c.endDate == entry.endDate;
+            });
+            if (it != cycles.end()) {
+                cycles.erase(it);
+                cout << GREEN << "Redo: removed cycle starting " << entry.startDate << RESET << "\n";
+                undoStack.push({"del", entry});
+            } else {
+                cout << YELLOW << "Redo: cycle not present to delete." << RESET << "\n";
+            }
         } else {
-            cycles.push_back(top);
-            cout << GREEN << "Redo: restored cycle starting " << top.startDate << RESET << "\n";
-            undoStack.push(top);
+            cout << RED << "Unknown redo action." << RESET << "\n";
         }
         rebuildRemindersFromCycles();
     }
@@ -335,7 +381,12 @@ public:
         cout << left << BOLD;
         cout << setw(12) << "START" << setw(12) << "END" << setw(8) << "DAYS" << setw(12) << "CYCLE_LEN" << "\n" << RESET;
         cout << "------------------------------------------------\n";
-        for (const auto &c : cycles) {
+        // ensure sorted by start date
+        vector<CycleEntry> sorted = cycles;
+        sort(sorted.begin(), sorted.end(), [](const CycleEntry &a, const CycleEntry &b){
+            return a.startDate < b.startDate;
+        });
+        for (const auto &c : sorted) {
             cout << setw(12) << c.startDate << setw(12) << c.endDate << setw(8) << c.durationDays
                  << setw(12) << (c.cycleLength > 0 ? to_string(c.cycleLength) : "N/A") << "\n";
         }
@@ -362,12 +413,15 @@ public:
             return;
         }
         int avgLen = averageCycleLength();
-        string lastStart = cycles.back().startDate;
+        // find the most recent start (max startDate)
+        string lastStart = cycles.front().startDate;
+        for (const auto &c : cycles) if (c.startDate > lastStart) lastStart = c.startDate;
         string predictedNext = addDays(lastStart, avgLen);
         cout << CYAN << "Average cycle length: " << avgLen << " days" << RESET << "\n";
         cout << GREEN << "Next predicted period start: " << BOLD << predictedNext << RESET << "\n";
         int daysLeft = daysFromTodayTo(predictedNext);
-        if (daysLeft >= 0) cout << YELLOW << "Days left until next period: " << daysLeft << RESET << "\n";
+        if (daysLeft > 0) cout << YELLOW << "Days left until next period: " << daysLeft << RESET << "\n";
+        else if (daysLeft == 0) cout << YELLOW << "Predicted date is today." << RESET << "\n";
         else cout << YELLOW << "Predicted date is in the past by " << -daysLeft << " day(s)." << RESET << "\n";
     }
 
@@ -377,7 +431,9 @@ public:
 
         if (!cycles.empty()) {
             int avgLen = averageCycleLength();
-            string lastStart = cycles.back().startDate;
+            // find latest start date
+            string lastStart = cycles.front().startDate;
+            for (const auto &c : cycles) if (c.startDate > lastStart) lastStart = c.startDate;
             string predicted = addDays(lastStart, avgLen);
             sys_time tp;
             if (stringToTimePoint(predicted, tp)) {
